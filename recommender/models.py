@@ -596,3 +596,56 @@ class MLModelRegistry(models.Model):
 
     trained_at = models.DateTimeField(auto_now_add=True)
     is_active = models.BooleanField(default=False)
+
+
+# recommender/models.py
+
+class MessageDeliveryLog(models.Model):
+    customer = models.ForeignKey(customer_details, on_delete=models.CASCADE)
+    recommendation = models.ForeignKey(
+        PestRecommendation,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True
+    )
+
+    channel = models.CharField(max_length=20)  # whatsapp / email
+    recipient = models.CharField(max_length=255)
+
+    message = models.TextField()
+
+    provider = models.CharField(max_length=50, default="rapbooster")
+    provider_message_id = models.CharField(max_length=255, null=True, blank=True)
+
+    provider_status = models.CharField(max_length=50)
+    raw_response = models.JSONField()
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "message_delivery_log"
+        indexes = [
+            models.Index(fields=["customer", "channel"]),
+            models.Index(fields=["provider_message_id"]),
+        ]
+
+
+# models.py
+class MessageLog(models.Model):
+    CHANNELS = (
+        ("whatsapp", "WhatsApp"),
+        ("email", "Email"),
+    )
+
+    customer = models.ForeignKey(customer_details, on_delete=models.CASCADE)
+    channel = models.CharField(max_length=20, choices=CHANNELS)
+    template = models.ForeignKey(
+        MessageTemplates, null=True, blank=True, on_delete=models.SET_NULL
+    )
+
+    message_id = models.CharField(max_length=255, unique=True)
+    status = models.CharField(max_length=50, default="queued")
+
+    provider_response = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)

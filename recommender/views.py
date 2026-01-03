@@ -277,108 +277,101 @@ from django.shortcuts import render
 from django.core.paginator import Paginator
 from django.db import connection
 from django.shortcuts import render
- 
-from django.core.paginator import Paginator
-from django.db import connection
-from django.shortcuts import render
-from django.core.paginator import Paginator
-from django.db import connection
-from django.shortcuts import render
-
 
 def recommendation_dashboard(request):
     filter_type = (request.GET.get("type") or "").strip().lower()
-    algo = (request.GET.get("algo") or "").strip().lower()
+    algo_button = (request.GET.get("algo") or "").strip().lower()
     search = (request.GET.get("search") or "").strip()
 
-    sql = """
+    algo_map = {
+        "rule-based": "rule_based",
+        "content-based": "content",
+        "collaborative": "collaborative",
+        "demographic": "demographic",
+        "hybrid": "hybrid",
+    }
+    algo = algo_map.get(algo_button)
+    params = []
+
+    # -------------------------------
+    # SUBQUERY: rank product & service separately
+    # -------------------------------
+    subquery = """
+        SELECT *
+        FROM (
+            SELECT
+                pr.customer_fk,
+                pr.recommended_product_id,
+                pr.recommended_service_id,
+                pr.reco_channel,
+                pr.business_intent,
+                pr.algorithm_strategy,
+                pr.confidence_score,
+                ROW_NUMBER() OVER (
+                    PARTITION BY pr.customer_fk, pr.reco_channel
+                    ORDER BY pr.confidence_score DESC
+                ) AS rn
+            FROM pest_recommendations pr
+            WHERE pr.is_active = 1
+    """
+
+    if filter_type:
+        subquery += " AND pr.business_intent = %s"
+        params.append(filter_type)
+
+    if algo:
+        subquery += " AND pr.algorithm_strategy = %s"
+        params.append(algo)
+
+    subquery += ") ranked WHERE rn = 1"
+
+    # -------------------------------
+    # MAIN QUERY: merge product + service into one row per customer
+    # -------------------------------
+    sql = f"""
         SELECT
-            pr.customer_id,
+            pr.customer_fk,
             c.fullname,
             c.primarycontact,
             c.primaryemail,
-
             CONCAT_WS(', ',
                 c.soldtopartyaddress,
                 c.soldtopartycity,
                 c.soldtopartystate,
                 c.soldtopartypostal
             ) AS address,
-
             lp.product_name AS purchase_product,
             sp.quantity,
             sp.price,
             sm.service_date,
-
-            rp.product_name AS recommended_product,
-            sc.service_name AS recommended_service,
-
-            COALESCE(rp.category, sc.service_category) AS category,
-            pr.business_intent,
-            pr.algorithm_strategy,
-            pr.confidence_score
-
-        FROM pest_recommendations pr
-
-        LEFT JOIN crmapp_customer_details c
-            ON c.id = pr.customer_id
-
-        LEFT JOIN crmapp_service_management sm
-            ON sm.id = (
-                SELECT id
-                FROM crmapp_service_management
-                WHERE customer_id = c.id
-                ORDER BY service_date DESC
-                LIMIT 1
-            )
-
-        LEFT JOIN crmapp_serviceproduct sp
-            ON sp.id = (
-                SELECT id
-                FROM crmapp_serviceproduct
-                WHERE service_id = sm.id
-                ORDER BY id DESC
-                LIMIT 1
-            )
-
-        LEFT JOIN crmapp_product lp
-            ON lp.product_id = sp.product_id
-
-        LEFT JOIN crmapp_product rp
-            ON rp.product_id = pr.recommended_product_id
-
-        LEFT JOIN service_catalog sc
-            ON sc.service_id = pr.recommended_service_id
-
-        WHERE pr.is_active = 1
+            MAX(CASE WHEN pr.reco_channel = 'product' THEN rp.product_name END) AS recommended_product,
+            MAX(CASE WHEN pr.reco_channel = 'service' THEN sc.service_name END) AS recommended_service,
+            COALESCE(MAX(rp.category), MAX(sc.service_category)) AS category,
+            MAX(pr.business_intent) AS business_intent,
+            MAX(pr.algorithm_strategy) AS algorithm_strategy,
+            MAX(pr.confidence_score) AS confidence_score
+        FROM ({subquery}) pr
+        LEFT JOIN crmapp_customer_details c ON c.id = pr.customer_fk
+        LEFT JOIN crmapp_service_management sm ON sm.customer_id = c.id
+        LEFT JOIN crmapp_serviceproduct sp ON sp.service_id = sm.id
+        LEFT JOIN crmapp_product lp ON lp.product_id = sp.product_id
+        LEFT JOIN crmapp_product rp ON rp.product_id = pr.recommended_product_id
+        LEFT JOIN service_catalog sc ON sc.service_id = pr.recommended_service_id
     """
 
-    params = []
-
-    # ✅ Business Intent filter (Upsell / Crosssell / Retention)
-    if filter_type:
-        sql += " AND pr.business_intent = %s"
-        params.append(filter_type)
-
-    # ✅ Algorithm filter (content / collaborative / demographic)
-    if algo:
-        sql += " AND pr.algorithm_strategy = %s"
-        params.append(algo)
-
-    # ✅ Search filter
     if search:
         sql += """
-            AND (
+            WHERE (
                 c.fullname LIKE %s
-                OR lp.product_name LIKE %s
                 OR rp.product_name LIKE %s
                 OR sc.service_name LIKE %s
             )
         """
         like = f"%{search}%"
-        params.extend([like, like, like, like])
+        params.extend([like, like, like])
 
-    sql += " ORDER BY pr.confidence_score DESC, sm.service_date DESC"
+    sql += " GROUP BY pr.customer_fk, c.fullname, c.primarycontact, c.primaryemail, address, lp.product_name, sp.quantity, sp.price, sm.service_date"
+    sql += " ORDER BY confidence_score DESC, sm.service_date DESC"
 
     with connection.cursor() as cursor:
         cursor.execute(sql, params)
@@ -390,30 +383,31 @@ def recommendation_dashboard(request):
         "phone": r[2],
         "email": r[3],
         "address": r[4] or "—",
-
         "purchase_product": r[5] or "—",
         "quantity": r[6] or "—",
         "price": float(r[7]) if r[7] else "—",
         "purchase_date": r[8],
-
         "recommended_product": r[9] or "—",
         "recommended_service": r[10] or "—",
-
         "category": r[11] or "—",
-        "business_intent": r[12],
-        "algorithm_strategy": r[13],   # ✅ FIXED KEY NAME
+        "business_intent": r[12] or "—",
+        "algorithm_strategy": r[13] or "—",
         "confidence_score": float(r[14]) if r[14] else 0,
     } for r in rows]
 
     paginator = Paginator(recommendations, 15)
     page_obj = paginator.get_page(request.GET.get("page"))
 
-    return render(request, "recommender/recommendation_dashboard.html", {
-        "page_obj": page_obj,
-        "filter_type": filter_type,
-        "algo": algo,
-        "search": search,
-    })
+    return render(
+        request,
+        "recommender/recommendation_dashboard.html",
+        {
+            "page_obj": page_obj,
+            "filter_type": filter_type,
+            "algo": algo_button,
+            "search": search,
+        }
+    )
 
 
 # ============================================================
@@ -927,150 +921,170 @@ def replace_placeholders(message, values: dict):
     return message
 
 
-# -----------------------------------------
-# 📩 Final Unified API
-# ----------------------------------------- 
-
-@login_required
-@require_POST
-@csrf_exempt 
-
+ 
 # ====================================================================
 #   UNIFIED API — SEND WhatsApp / Email (Templates or Custom Message)
 # ====================================================================
 
-@login_required
-@csrf_exempt
+from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+import json
+from crmapp.models import customer_details, MessageTemplates
+from recommender.rapbooster_api import (
+    send_whatsapp_message,
+    send_email_message,
+    check_message_status
+)
+
 @csrf_exempt
 def send_message_api(request):
     try:
-        payload = json.loads(request.body.decode("utf-8"))
-    except:
-        return HttpResponseBadRequest("Invalid JSON")
+        # ----------------- METHOD CHECK -----------------
+        if request.method != "POST":
+            return JsonResponse({"sent": False, "error": "POST only"}, status=405)
 
-    customer_id = payload.get("customer_id")
-    template_id = payload.get("template_id")
-    message_body = payload.get("message_body")
-    send_channel = payload.get("send_channel", "whatsapp")
-    purpose = payload.get("purpose", "general")
-    contract = payload.get("contract", "")
-    extra = payload.get("extra", {})
-
-    if not customer_id:
-        return HttpResponseBadRequest("Missing customer_id")
-
-    # ---------------------------------------------------------
-    # Load Customer
-    # ---------------------------------------------------------
-    try:
-        cust = customer_details.objects.get(id=customer_id)
-    except customer_details.DoesNotExist:
-        return JsonResponse({"error": "Customer not found"}, status=404)
-
-    phone = str(cust.primarycontact or "").strip()
-    email = cust.primaryemail or ""
-
-    # ---------------------------------------------------------
-    # Load template / message
-    # ---------------------------------------------------------
-    if template_id:
+        # ----------------- PARSE PAYLOAD -----------------
         try:
-            template = MessageTemplates.objects.get(id=template_id)
-            raw_body = template.body
-        except MessageTemplates.DoesNotExist:
-            return JsonResponse({"error": "Template not found"}, status=404)
-    else:
-        if not message_body:
-            return HttpResponseBadRequest("Either template_id or message_body required")
+            payload = json.loads(request.body.decode("utf-8"))
+        except json.JSONDecodeError:
+            return JsonResponse({"sent": False, "error": "Invalid JSON"}, status=400)
+
+        customer_id = payload.get("customer_id")
+        template_id = payload.get("template_id")
+        message_body = payload.get("message_body", "")
+        send_channel = payload.get("send_channel", "whatsapp").lower()
+        extra = payload.get("extra", {})
+        poll_status = payload.get("poll_status", True)
+
+        if not customer_id:
+            return JsonResponse({"sent": False, "error": "Missing customer_id"}, status=400)
+
+        # ----------------- FETCH CUSTOMER -----------------
+        try:
+            cust = customer_details.objects.get(id=customer_id)
+        except customer_details.DoesNotExist:
+            return JsonResponse({"sent": False, "error": "Customer not found"}, status=404)
+
+        # ----------------- FETCH TEMPLATE -----------------
+        template = None
         raw_body = message_body
+        subject = "Notification"
 
-    # ---------------------------------------------------------
-    # Prepare Placeholder Variables
-    # ---------------------------------------------------------
-    variables = {
-        "customer_name": cust.fullname,
-        "phone": phone,
-        "email": email,
-        "contract": contract,
-    }
+        if template_id:
+            template = MessageTemplates.objects.filter(id=template_id).first()
+            if not template:
+                return JsonResponse({"sent": False, "error": "Template not found"}, status=404)
+            raw_body = template.body or ""
+            if template.subject:
+                subject = template.subject
 
-    final_body = replace_placeholders(raw_body, {**variables, **extra})
+        if not raw_body.strip():
+            return JsonResponse({"sent": False, "error": "Message body empty"}, status=400)
 
-    # ---------------------------------------------------------
-    # SEND WHATSAPP
-    # ---------------------------------------------------------
-    if send_channel.lower() == "whatsapp":
-
-        if not phone or not re.fullmatch(r"\+?\d{10,15}", phone):
-            return JsonResponse({"error": "Invalid or missing phone number"}, status=400)
-
-        status, provider = send_whatsapp_message(phone, final_body, cust)
-
-        SentMessageLog.objects.create(
-            customer=cust,
-            template_id=template_id,
-            recipient=phone,
-            channel="whatsapp",
-            rendered_body=final_body,
-            status=status,
-            provider_response=str(provider),
-            purpose=purpose,
-            contract=contract,
+        # ----------------- REPLACE PLACEHOLDERS -----------------
+        final_body = replace_placeholders(
+            raw_body,
+            {
+                "customer_name": cust.fullname,
+                "phone": cust.primarycontact or "",
+                "email": cust.primaryemail or "",
+                **extra,
+            },
         )
 
-        if status != "sent":
-            return JsonResponse({
-                "sent": False,
-                "error": "WhatsApp sending failed",
-                "provider": provider,
-            }, status=400)
+        # ----------------- VALIDATE CHANNEL -----------------
+        if send_channel not in ["whatsapp", "email"]:
+            return JsonResponse({"sent": False, "error": "Invalid send_channel"}, status=400)
 
+        # ----------------- SEND MESSAGE -----------------
+        log = None
+        resp = None
+
+        if send_channel == "whatsapp":
+            if not cust.primarycontact:
+                return JsonResponse({"sent": False, "error": "Customer has no phone"}, status=400)
+
+            log, resp = send_whatsapp_message(
+                phone=cust.primarycontact,
+                message=final_body,
+                customer_name=cust.fullname,
+                customer=cust,
+                template=template,
+            )
+
+        elif send_channel == "email":
+            if not cust.primaryemail:
+                return JsonResponse({"sent": False, "error": "Customer has no email"}, status=400)
+
+            log, resp = send_email_message(
+                email=cust.primaryemail,
+                subject=subject,
+                message=final_body,
+                customer_name=cust.fullname,
+                customer=cust,
+                template=template,
+            )
+
+        if not log:
+            return JsonResponse({"sent": False, "error": "Failed to create message log"}, status=500)
+
+        # ----------------- DELIVERY STATUS -----------------
+        status = log.status
+        message_id = log.message_id
+        delivery_status = log.delivery_status or status
+
+        # Optional polling
+        if poll_status and message_id:
+            try:
+                status_resp = check_message_status(message_id)
+                delivery_status = status_resp.get("delivery_status", delivery_status)
+                log.delivery_status = delivery_status
+                log.save(update_fields=["delivery_status"])
+            except Exception as ex:
+                print(f"[Delivery Polling Error] {ex}")  # Log instead of silent pass
+
+        # ----------------- RESPONSE -----------------
         return JsonResponse({
-            "sent": True,
-            "channel": "whatsapp",
-            "message": final_body,
-            "provider": provider,
-            "purpose": purpose,
-            "contract": contract
+            "sent": status in ["queued", "sent", "delivered", "read"],
+            "status": status,
+            "message_id": message_id,
+            "delivery_status": delivery_status,
+            "provider": resp,
         })
 
-    # ---------------------------------------------------------
-    # SEND EMAIL
-    # ---------------------------------------------------------
-    elif send_channel.lower() == "email":
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JsonResponse({"sent": False, "error": str(e)}, status=500)
 
-        if not email:
-            return JsonResponse({"error": "Customer has no email"}, status=400)
 
-        status, provider = send_email_message(email, "Notification", final_body)
+import threading
+import time
 
-        SentMessageLog.objects.create(
-            customer=cust,
-            template_id=template_id,
-            recipient=email,
-            channel="email",
-            rendered_body=final_body,
-            status=status,
-            provider_response=str(provider),
-            purpose=purpose,
-            contract=contract
+def simulate_status_flow(log_id):
+    def run():
+        time.sleep(2)
+        SentMessageLog.objects.filter(id=log_id).update(
+            status="sent",
+            delivery_status="sent"
         )
 
-        return JsonResponse({
-            "sent": True,
-            "channel": "email",
-            "message": final_body,
-            "provider": provider
-        })
+        time.sleep(3)
+        SentMessageLog.objects.filter(id=log_id).update(
+            status="delivered",
+            delivery_status="delivered"
+        )
 
-    # ---------------------------------------------------------
-    # INVALID CHANNEL
-    # ---------------------------------------------------------
-    return JsonResponse({"error": "Invalid send_channel"}, status=400)
+        time.sleep(3)
+        SentMessageLog.objects.filter(id=log_id).update(
+            status="read",
+            delivery_status="read"
+        )
+
+    threading.Thread(target=run).start()
 
 
-
-# ====================================================================
+#===================================================================
 # SIMPLE API — WhatsApp Button (Customer Modal)
 # ====================================================================
 
@@ -2935,29 +2949,96 @@ from django.http import JsonResponse
 from crmapp.models import customer_details 
 from .views import get_message_template
 
-def recommendation_message_view(request, customer_id):
+from django.http import JsonResponse
+from crmapp.models import SentMessageLog
+from recommender.rapbooster_status import fetch_message_status
 
-    customer = customer_details.objects.get(customerid=customer_id)
 
-    # 1️⃣ Get model recommendations
-    recommendations = get_model_recommendations(customer.id)
+def message_status_api(request, message_id):
 
-    # 2️⃣ Pick template (example: WhatsApp, lead-hot)
-    template = get_message_template(
-        channel="whatsapp",
-        category="lead",
-        lead_status=customer.lead_status
-    )
+    try:
+        log = SentMessageLog.objects.get(message_id=message_id)
+    except SentMessageLog.DoesNotExist:
+        return JsonResponse({"error": "Message not found"}, status=404)
 
-    # 3️⃣ Render final message
-    final_message = render_message(
-        template.body,
-        customer,
-        recommendations
-    )
+    provider_status = fetch_message_status(message_id)
+
+    new_status = provider_status.get("status", "").lower()
+
+    if new_status and new_status != log.status:
+        log.status = new_status
+        log.provider_response = str(provider_status)
+        log.save(update_fields=["status", "provider_response"])
 
     return JsonResponse({
-        "customer": customer.customerid,
-        "channel": template.message_type,
-        "message": final_message
+        "message_id": message_id,
+        "channel": log.channel,
+        "status": log.status.upper()
     })
+
+
+from crmapp.models import SentMessageLog
+ 
+
+def populate_message_with_recommendations(customer_id, template_body):
+    """
+    Returns message body populated with recommended products/services
+    """
+
+    # Fetch recommended products/services for this customer
+    recs = PestRecommendation.objects.filter(
+        customer_id=customer_id,
+        is_active=True
+    )
+
+    products = [r.product_name for r in recs if r.recommendation_type == 'product']
+    services = [r.service_name for r in recs if r.recommendation_type == 'service']
+
+    # Inject into message template
+    message_body = template_body
+    if products:
+        message_body += "\n\nRecommended Products:\n- " + "\n- ".join(products)
+    if services:
+        message_body += "\n\nRecommended Services:\n- " + "\n- ".join(services)
+
+    return message_body, products, services
+
+
+from .rapbooster_api import send_to_rapbooster
+ 
+
+def send_message(customer, template_body, channel='whatsapp'):
+    """
+    Sends a message to a customer, auto-populating recommended products/services.
+    """
+
+    # 🔹 Fetch active recommendations
+    recs = PestRecommendation.objects.filter(
+        customer_fk=customer.id,
+        is_active=True
+    )
+
+    products = [r.product_name for r in recs if r.recommendation_type == 'product']
+    services = [r.service_name for r in recs if r.recommendation_type == 'service']
+
+    # 🔹 Inject recommendations into message body
+    message_body = template_body
+    if products:
+        message_body += "\n\nRecommended Products:\n- " + "\n- ".join(products)
+    if services:
+        message_body += "\n\nRecommended Services:\n- " + "\n- ".join(services)
+
+    # 🔹 Create initial DB log (queued)
+    msg_log = SentMessageLog.objects.create(
+        customer=customer,
+        message_body=message_body,
+        recommended_products=products,
+        recommended_services=services,
+        channel=channel,
+        status='queued'
+    )
+
+    # 🔹 Send via RapBooster API (mock or real)
+    send_to_rapbooster(msg_log)
+
+    return msg_log

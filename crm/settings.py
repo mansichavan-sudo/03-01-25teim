@@ -216,8 +216,16 @@ WHATSAPP_CHANNEL_ID = os.environ.get("WHATSAPP_CHANNEL_ID", "")
 # ------------------------------------------------------
 # WHATSAPP (RapBooster)
 # ------------------------------------------------------
-RAPBOOSTER_API_URL = "https://api.rapbooster.com/v1/send"
-RAPBOOSTER_API_KEY = "6538c8eff027d41e9151"
+#RAPBOOSTER_API_URL = "https://api.rapbooster.com/v1/send"
+#RAPBOOSTER_API_KEY = "6538c8eff027d41e9151"
+
+import os
+
+RAPBOOSTER_API_KEY = os.getenv("RAPBOOSTER_API_KEY")
+RAPBOOSTER_WHATSAPP_SENDER = os.getenv("RAPBOOSTER_WHATSAPP_SENDER")
+RAPBOOSTER_EMAIL_SENDER = os.getenv("RAPBOOSTER_EMAIL_SENDER")
+RAPBOOSTER_WEBHOOK_SECRET = os.getenv("RAPBOOSTER_WEBHOOK_SECRET")
+
 
 #FAST2SMS_API_KEY = "lmECgGI0f57i2x94H81uqVtTyObKhzFZMNLXA3oapseB6RQcJD5ZsIrukQRLzoCcKHWaBF6TliSXdUgA"
 

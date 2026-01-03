@@ -13,6 +13,13 @@ from .views import recommendation_ui, recommendations_view
 
 from recommender.views import hybrid_recommendations_api,served_recommendations,served_product_recommendations,served_service_recommendations ,customer_recommendations,customer_message_api,customer_reply_api,regenerate_service_view, generate_message
 from recommender.api_feedback import recommendation_feedback
+from .rapbooster_webhooks import rapbooster_delivery_callback
+from .api_views import api_message_status
+from .api_views import rapbooster_webhook 
+from .views_webhook import rapbooster_delivery_webhook
+
+
+from .api_views import send_message_api, message_status_api
 # API Views
 from .views import (
     api_ai_personalized,
@@ -98,7 +105,15 @@ urlpatterns = [
     path('api/generate-message/', views.generate_message, name='api_generate_message'),
 
     # ONLY ONE FINAL send-message endpoint
-    path('api/send-message/', api_send_message, name='api_send_message'),
+    #path('api/send-message/', api_send_message, name='api_send_message'), 
+    path(
+    'api/send-message/',
+    send_message_api,
+    name='send_message_api'
+),
+
+
+
 
     # ======================================
     # 📂 Customer Details
@@ -162,7 +177,7 @@ path("recommend/", recommend_products, name="recommend-products"),
 
  
 
-        path("api/customers/", views.get_all_customers),
+    path("api/customers/", views.get_all_customers),
     path("api/recommendations/<str:cust_id>/", views.get_recommendations),
    
     path("api/recommendations/<str:customer_id>/", get_recommendations),
@@ -257,6 +272,26 @@ path("recommend/", recommend_products, name="recommend-products"),
     regenerate_service_view
 ),
 path("generate-message/<int:customer_id>/", generate_message),
+ path("api/rapbooster/callback/", rapbooster_delivery_callback),
+ 
+    path("api/message-status/<str:message_id>/", api_message_status),
+    
+    path("api/rapbooster/webhook/", rapbooster_webhook),
+
+
+    
+    path("send-message/", send_message_api),
+    path("message-status/<str:message_id>/", message_status_api),
+
+    path("api/message-status/<str:message_id>/", message_status_api),
+    
+   # path("api/rapbooster/webhook/", rapbooster_delivery_webhook),
+     path(
+        "webhooks/rapbooster/delivery/",
+        rapbooster_delivery_webhook,
+        name="rapbooster_delivery_webhook"
+    ), 
+
 
 
 

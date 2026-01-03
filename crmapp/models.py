@@ -949,7 +949,6 @@ class SentMessageLog(models.Model):
         blank=True
     )
 
-    # 🔥 NEW FIELDS (Auto populated)
     customer_name = models.CharField(max_length=255, blank=True, null=True)
     product_name = models.CharField(max_length=255, blank=True, null=True)
     recommended_product_name = models.CharField(max_length=255, blank=True, null=True)
@@ -962,8 +961,9 @@ class SentMessageLog(models.Model):
     ]
     channel = models.CharField(max_length=20, choices=CHANNEL_CHOICES)
 
-    rendered_subject = models.CharField(max_length=255, blank=True, null=True)
+    rendered_subject = models.CharField(max_length=500, blank=True, null=True)
     rendered_body = models.TextField()
+
     message_id = models.CharField(max_length=100, blank=True, null=True)
 
     STATUS_CHOICES = [
@@ -971,19 +971,35 @@ class SentMessageLog(models.Model):
         ('sent', 'Sent'),
         ('delivered', 'Delivered'),
         ('read', 'Read'),
-        ('failed','Failed'),
+        ('opened', 'Opened'),
+        ('failed', 'Failed'),
         ('error', 'Error'),
     ]
-    status = models.CharField(max_length=50, choices=STATUS_CHOICES, default='queued')
+
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default='queued'
+    )
+
+    delivery_status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        null=True,
+        blank=True
+    )
+
+    delivery_payload = models.JSONField(null=True, blank=True)
 
     provider_response = models.TextField(blank=True, null=True)
+    error_message = models.TextField(null=True, blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
+    sent_at = models.DateTimeField(null=True, blank=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
-        return f"{self.channel} => {self.recipient} | {self.status}"
-
+        return f"{self.channel} → {self.recipient} | {self.delivery_status or self.status}"
 
 from django.contrib.auth.models import User
 from django.db import models
@@ -1227,6 +1243,7 @@ class ServiceCatalog(models.Model):
     service_category = models.CharField(max_length=100, null=True, blank=True)
     base_price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
     active = models.BooleanField(default=True)  
+    is_recommendable = models.BooleanField(default=True) 
 
     class Meta:
         db_table = "service_catalog"

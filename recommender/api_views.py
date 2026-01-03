@@ -130,10 +130,42 @@ def api_customer_details(request, cid):
 #   "contract": "3 Months",      # optional
 #   "extra": { "product": "X" }  # optional placeholders
 # }
-# --------------------------
+# -------------------------- 
+import json
+import os
+import re
+import logging
+import requests
+
+from django.http import JsonResponse, HttpResponseBadRequest
+from django.views.decorators.http import require_POST
+from django.views.decorators.csrf import csrf_exempt
+
+from crmapp.models import customer_details, MessageTemplates
+from crmapp.models import SentMessageLog
+from recommender.rapbooster_api import (
+    send_recommendation_message,
+    send_email_message
+)
+
+logger = logging.getLogger(__name__)
+
+
+def simple_replace(text: str, variables: dict) -> str:
+    """
+    Replace {{var}} placeholders safely
+    """
+    for k, v in variables.items():
+        text = text.replace(f"{{{{{k}}}}}", str(v))
+    return text
+
+
 @csrf_exempt
 @require_POST
 def api_send_message(request):
+    # -------------------------------------------------
+    # 1. Parse request
+    # -------------------------------------------------
     try:
         payload = json.loads(request.body.decode("utf-8"))
     except Exception:
@@ -141,117 +173,175 @@ def api_send_message(request):
 
     customer_id = payload.get("customer_id")
     template_id = payload.get("template_id")
-    message_body = payload.get("message_body")  # raw fallback
+    message_body = payload.get("message_body")
     send_channel = (payload.get("send_channel") or "whatsapp").lower()
     contract = payload.get("contract", "")
     extra = payload.get("extra", {}) or {}
+    subject = payload.get("subject", "Notification")
 
     if not customer_id:
         return HttpResponseBadRequest("Missing customer_id")
 
+    # -------------------------------------------------
+    # 2. Resolve customer
+    # -------------------------------------------------
     try:
         customer = customer_details.objects.get(id=customer_id)
     except customer_details.DoesNotExist:
         return JsonResponse({"error": "Customer not found"}, status=404)
 
-    # Determine raw template/body
-    raw = ""
+    # -------------------------------------------------
+    # 3. Resolve template / raw body
+    # -------------------------------------------------
     template_obj = None
+    raw_body = ""
+
     if template_id:
         try:
             template_obj = MessageTemplates.objects.get(id=template_id)
-            raw = template_obj.body or ""
+            raw_body = template_obj.body or ""
         except MessageTemplates.DoesNotExist:
             return JsonResponse({"error": "Template not found"}, status=404)
     else:
         if not message_body:
-            return HttpResponseBadRequest("Either template_id or message_body required")
-        raw = message_body
+            return HttpResponseBadRequest(
+                "Either template_id or message_body required"
+            )
+        raw_body = message_body
 
-    # Build placeholder values
+    # -------------------------------------------------
+    # 4. Build variables
+    # -------------------------------------------------
+    phone = (
+        getattr(customer, "primarycontact", "")
+        or getattr(customer, "secondarycontact", "")
+        or ""
+    )
+
+    email = (
+        getattr(customer, "primaryemail", "")
+        or getattr(customer, "email", "")
+        or ""
+    )
+
     base_vars = {
         "customer_name": getattr(customer, "fullname", "") or "",
-        "phone": str(getattr(customer, "primarycontact", "") or getattr(customer, "secondarycontact", "") or ""),
-        "email": getattr(customer, "email", "") or "",
+        "phone": phone,
+        "email": email,
         "contract": contract or ""
     }
-    all_vars = {**base_vars, **(extra or {})}
 
-    final_message = simple_replace(raw, all_vars)
+    final_vars = {**base_vars, **extra}
+    final_message = simple_replace(raw_body, final_vars)
 
-    # Send based on channel
-    try:
-        if send_channel == "whatsapp":
-            phone = base_vars["phone"]
-            if not phone or not re.fullmatch(r"\+?\d{10,15}", phone):
-                return JsonResponse({"error": "Invalid or missing phone number for customer"}, status=400)
+    # -------------------------------------------------
+    # 5. WHATSAPP
+    # -------------------------------------------------
+    if send_channel == "whatsapp":
+        if not phone or not re.fullmatch(r"\+?\d{10,15}", phone):
+            return JsonResponse(
+                {"error": "Invalid or missing phone number"},
+                status=400
+            )
 
-            # Use your rapbooster helper if available
-            # Example signature: send_recommendation_message(phone_number=..., message=..., customer_name=...)
-            # Fallback: call RapBooster REST endpoint directly
-            try:
-                # prefer internal helper if it exists
-                if hasattr(send_recommendation_message, "__call__"):
-                    status_code, provider_resp = send_recommendation_message(phone_number=phone, message=final_message, customer_name=customer.fullname)
-                    success = status_code == 200
-                else:
-                    # fallback direct call
-                    RB_KEY = os.getenv("RAPBOOSTER_API_KEY") or "6538c8eff027d41e9151"
-                    RB_URL = "https://api.rapbooster.com/v1/send"
-                    resp = requests.post(RB_URL, json={"apikey": RB_KEY, "phone": phone, "message": final_message}, timeout=10)
-                    provider_resp = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {"raw": resp.text}
-                    success = resp.status_code == 200 and provider_resp.get("status") == "success"
+        try:
+            status_code, provider_resp, message_id = send_recommendation_message(
+                phone_number=phone,
+                message=final_message,
+                customer_name=customer.fullname
+            )
 
-            except Exception as e:
-                logger.exception("RapBooster send error")
-                success = False
-                provider_resp = {"error": str(e)}
+            success = status_code == 200
 
-            # Log message
-            try:
-                SentMessageLog.objects.create(
-                    template=template_obj if template_obj else None,
-                    recipient=phone,
-                    channel="whatsapp",
-                    rendered_body=final_message,
-                    status="success" if success else "failed",
-                    provider_response=str(provider_resp)
-                )
-            except Exception:
-                logger.exception("Failed to log SentMessage")
+        except Exception as e:
+            logger.exception("WhatsApp send failed")
+            success = False
+            provider_resp = {"error": str(e)}
+            message_id = None
 
-            if not success:
-                return JsonResponse({"sent": False, "provider_response": provider_resp}, status=400)
+        # -------------------------------------------------
+        # Log
+        # -------------------------------------------------
+        log = SentMessageLog.objects.create(
+            customer=customer,
+            template=template_obj,
+            recipient=phone,
+            channel="whatsapp",
+            rendered_body=final_message,
+            status="sent" if success else "failed",
+            message_id=message_id,
+            provider_response=str(provider_resp)
+        )
 
-            return JsonResponse({"sent": True, "provider_response": provider_resp})
+        if not success:
+            return JsonResponse(
+                {
+                    "sent": False,
+                    "message_id": log.message_id,
+                    "provider_response": provider_resp
+                },
+                status=400
+            )
 
-        elif send_channel == "email":
-            email = base_vars["email"]
-            if not email:
-                return JsonResponse({"error": "Customer has no email"}, status=400)
+        return JsonResponse(
+            {
+                "sent": True,
+                "message_id": log.message_id,
+                "status": log.status
+            }
+        )
 
-            # Use your send_email_message helper
-            try:
-                result = send_email_message(email, payload.get("subject", "Notification"), final_message)
-                SentMessageLog.objects.create(
-                    template=template_obj if template_obj else None,
-                    recipient=email,
-                    channel="email",
-                    rendered_body=final_message,
-                    status="success",
-                    provider_response=str(result)
-                )
-                return JsonResponse({"sent": True, "email_response": result})
-            except Exception as e:
-                logger.exception("Email send error")
-                return JsonResponse({"sent": False, "error": str(e)}, status=500)
+    # -------------------------------------------------
+    # 6. EMAIL
+    # -------------------------------------------------
+    elif send_channel == "email":
+        if not email:
+            return JsonResponse(
+                {"error": "Customer has no email"},
+                status=400
+            )
 
-        else:
-            return JsonResponse({"error": "Unknown send_channel"}, status=400)
+        try:
+            provider_resp, message_id = send_email_message(
+                email=email,
+                subject=subject,
+                message=final_message,
+                customer_name=customer.fullname
+            )
 
-    except Exception as e:
-        logger.exception("api_send_message error")
-        return JsonResponse({"error": str(e)}, status=500)
+            log = SentMessageLog.objects.create(
+                customer=customer,
+                template=template_obj,
+                recipient=email,
+                channel="email",
+                rendered_body=final_message,
+                status="sent",
+                message_id=message_id,
+                provider_response=str(provider_resp)
+            )
+
+            return JsonResponse(
+                {
+                    "sent": True,
+                    "message_id": log.message_id,
+                    "status": log.status
+                }
+            )
+
+        except Exception as e:
+            logger.exception("Email send failed")
+            return JsonResponse(
+                {"sent": False, "error": str(e)},
+                status=500
+            )
+
+    # -------------------------------------------------
+    # 7. Invalid channel
+    # -------------------------------------------------
+    return JsonResponse(
+        {"error": "Unknown send_channel"},
+        status=400
+    )
 
 
 # -------------------------
@@ -487,3 +577,192 @@ def api_get_recommendations(request, customer_id):
         "recommendations": result.get("recommendations", []),
         "message": result.get("message", "")
     }, status=200)
+
+
+from django.views.decorators.http import require_GET
+
+from django.http import JsonResponse
+from crmapp.models import SentMessageLog
+
+
+def api_message_status(request, message_id):
+
+    try:
+        msg = SentMessageLog.objects.get(message_id=message_id)
+    except SentMessageLog.DoesNotExist:
+        return JsonResponse({
+            "error": "Message not found"
+        }, status=404)
+
+    return JsonResponse({
+        "message_id": msg.message_id,
+        "status": msg.status.upper(),
+        "channel": msg.channel
+    })
+
+
+import json
+from django.views.decorators.csrf import csrf_exempt
+from django.http import JsonResponse
+from crmapp.models import SentMessageLog
+
+
+@csrf_exempt
+def rapbooster_webhook(request):
+
+    try:
+        payload = json.loads(request.body.decode("utf-8"))
+    except Exception:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    message_id = payload.get("message_id")
+    status = payload.get("status")
+
+    if not message_id or not status:
+        return JsonResponse({"error": "message_id and status required"}, status=400)
+
+    try:
+        msg = SentMessageLog.objects.get(message_id=message_id)
+    except SentMessageLog.DoesNotExist:
+        return JsonResponse({"error": "Message not found"}, status=404)
+
+    # Normalize statuses
+    STATUS_MAP = {
+        "sent": "sent",
+        "delivered": "delivered",
+        "read": "read",
+        "failed": "failed",
+        "bounced": "failed"
+    }
+
+    normalized_status = STATUS_MAP.get(status.lower(), status.lower())
+
+    msg.status = normalized_status
+    msg.provider_response = payload
+    msg.save(update_fields=["status", "provider_response"])
+
+    return JsonResponse({"ok": True})
+
+
+import json
+import uuid
+from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+from crmapp.models import SentMessageLog, MessageTemplates, customer_details
+from recommender.rapbooster_api import (
+    send_whatsapp_message,
+    send_email_message
+)
+
+@csrf_exempt
+def send_message_api(request):
+    if request.method != "POST":
+        return JsonResponse({"sent": False, "error": "POST only"}, status=405)
+
+    try:
+        data = json.loads(request.body.decode("utf-8"))
+    except Exception:
+        return JsonResponse({"sent": False, "error": "Invalid JSON"}, status=400)
+
+    # ------------------ REQUIRED FIELDS ------------------
+    customer_id = data.get("customer_id")
+    template_id = data.get("template_id")
+    rendered_message = data.get("rendered_message") or data.get("message_body")
+    subject = data.get("subject", "")
+    send_channel = data.get("send_channel", data.get("channel", "whatsapp")).lower()
+
+    if not customer_id or not rendered_message:
+        return JsonResponse({"sent": False, "error": "Missing required fields"}, status=400)
+
+    if send_channel not in ["whatsapp", "email"]:
+        return JsonResponse({"sent": False, "error": "Invalid channel"}, status=400)
+
+    # ------------------ FETCH DB OBJECTS ------------------
+    try:
+        customer = customer_details.objects.get(id=customer_id)
+    except customer_details.DoesNotExist:
+        return JsonResponse({"sent": False, "error": "Customer not found"}, status=404)
+
+    template = None
+    if template_id:
+        template = MessageTemplates.objects.filter(id=template_id).first()
+
+    recipient = (
+        customer.primarycontact
+        if send_channel == "whatsapp"
+        else customer.primaryemail
+    )
+
+    if not recipient:
+        return JsonResponse(
+            {"sent": False, "error": f"No recipient for {send_channel}"},
+            status=400
+        )
+
+    # ------------------ CREATE LOG FIRST ------------------
+    log = SentMessageLog.objects.create(
+        template=template,
+        customer=customer,
+        customer_name=customer.fullname,
+        recipient=recipient,
+        channel=send_channel,
+        rendered_subject=subject,
+        rendered_body=rendered_message,
+        status="queued",
+    )
+
+    # ------------------ SEND MESSAGE ------------------
+    try:
+        if send_channel == "whatsapp":
+            status, response, provider_id = send_whatsapp_message(
+                phone=recipient,
+                message=rendered_message,
+                customer_name=customer.fullname,
+                customer=customer,
+                template=template,
+            )
+        else:
+            status, response, provider_id = send_email_message(
+                email=recipient,
+                subject=subject,
+                message=rendered_message,
+                customer_name=customer.fullname,
+                customer=customer,
+                template=template,
+            )
+    except Exception as e:
+        log.status = "failed"
+        log.provider_response = str(e)
+        log.save(update_fields=["status", "provider_response"])
+        return JsonResponse({"sent": False, "error": "Provider error"}, status=500)
+
+    # ------------------ UPDATE LOG ------------------
+    log.status = status
+    log.provider_response = json.dumps(response)
+    log.message_id = provider_id or f"rb_{log.id}"
+    log.save()
+
+    return JsonResponse({
+        "sent": True,
+        "status": status,
+        "message_id": log.message_id,
+    })
+
+@csrf_exempt
+def message_status_api(request, message_id):
+    try:
+        log = SentMessageLog.objects.get(message_id=message_id)
+
+        return JsonResponse({
+            "success": True,
+            "message_id": message_id,
+            "status": log.status,
+            "delivery_status": log.delivery_status or log.status,
+            "updated_at": log.updated_at
+        })
+
+    except SentMessageLog.DoesNotExist:
+        return JsonResponse({
+            "success": False,
+            "error": "Message not found"
+        }, status=404)

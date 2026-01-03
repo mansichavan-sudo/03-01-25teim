@@ -207,6 +207,44 @@
         <textarea id="messagePreview" class="form-control"></textarea>
 
         <button class="btn btn-success mt-3 w-100" onclick="openSendModal()">Send to Customer</button>
+        <div class="modal fade" id="sendConfirmModal" tabindex="-1">
+  <div class="modal-dialog modal-lg modal-dialog-centered">
+    <div class="modal-content">
+
+      <div class="modal-header">
+        <h5 class="modal-title">Confirm Message Send</h5>
+        <button class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+
+      <div class="modal-body">
+        <p><strong>Customer:</strong> <span id="confirmCustomer"></span></p>
+        <p><strong>Template:</strong> <span id="confirmTemplate"></span></p>
+
+        <label class="fw-bold mt-2">Message Preview</label>
+        <pre id="confirmBody"
+             class="p-3 bg-light border rounded"
+             style="white-space:pre-wrap;"></pre>
+      </div>
+
+      <div class="modal-footer">
+        <button class="btn btn-secondary"
+                data-bs-dismiss="modal">Cancel</button>
+
+        <button class="btn btn-success"
+                onclick="confirmSend()">Send Now</button>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+        <div id="deliveryStatusBox"
+     class="alert alert-info mt-3"
+     style="display:none;">
+    <strong>Status:</strong>
+    <span id="deliveryStatusText">Queued</span>
+</div>
+
 
     </div>
 </div>
@@ -262,7 +300,7 @@ function renderTemplate(text, data) {
 
 /* --------------------------------------------------
    LOAD CUSTOMERS
--------------------------------------------------- */
+-------------------------------------------------- */ 
 async function loadCustomers() {
     try {
         const res = await fetch('/api/customers/');
@@ -275,11 +313,17 @@ async function loadCustomers() {
         (data.customers || data).forEach(c => {
             dropdown.innerHTML += `
                 <option value="${c.id}"
-                        data-customerid="${c.customerid}"
+                        data-customerid="${c.customerid || ''}"
                         data-phone="${c.primarycontact || ''}"
-                        data-fullname="${c.fullname}"
-                        data-address="${c.soldtopartyaddress}, ${c.soldtopartycity}, ${c.soldtopartystate} ${c.soldtopartypostal}">
-                    ${c.customerid} – ${c.fullname}
+                        data-email="${c.primaryemail || ''}"
+                        data-fullname="${c.fullname || ''}"
+                        data-address="${[
+                            c.soldtopartyaddress,
+                            c.soldtopartycity,
+                            c.soldtopartystate,
+                            c.soldtopartypostal
+                        ].filter(Boolean).join(', ')}">
+                    ${c.customerid || '—'} – ${c.fullname || ''}
                 </option>`;
         });
 
@@ -288,29 +332,27 @@ async function loadCustomers() {
     }
 }
 
-/* --------------------------------------------------
-   LOAD CUSTOMER DETAILS
--------------------------------------------------- */ 
-function loadCustomerDetails() {
-    const opt = this.selectedOptions[0];
+function loadCustomerDetails(e) {
+    const opt = e.target.selectedOptions[0];
 
-    if (!opt.value) {
+    if (!opt || !opt.value) {
         document.getElementById("customerDetails").style.display = "none";
         return;
     }
 
     document.getElementById("customerDetails").style.display = "block";
 
-    document.getElementById("custId").textContent = opt.dataset.customerid;
-    document.getElementById("custName").textContent = opt.dataset.fullname;
-    document.getElementById("custAddress").textContent = opt.dataset.address;
+    document.getElementById("custId").textContent = opt.dataset.customerid || "—";
+    document.getElementById("custName").textContent = opt.dataset.fullname || "—";
+    document.getElementById("custAddress").textContent = opt.dataset.address || "—";
 
-    // Product history uses CUSTOMER CODE
+    // ✅ Product history → CUSTOMER CODE
     loadPurchaseHistory(opt.dataset.customerid);
 
-    // Service history uses INTERNAL NUMERIC ID
+    // ✅ Service history → INTERNAL ID
     loadServiceHistory(opt.value);
 
+    // ✅ Contract uses CUSTOMER CODE
     loadCustomerContract(opt.dataset.customerid);
 }
 
@@ -526,7 +568,7 @@ function renderReco(data, targetId, title) {
         data.products.forEach(p => {
             html += `<li>
                 <strong>${p.product_name}</strong>
-                (Confidence ${p.confidence})
+          
             </li>`;
         });
     }
@@ -540,7 +582,7 @@ function renderReco(data, targetId, title) {
         data.services.forEach(s => {
             html += `<li>
                 <strong>${s.service_name}</strong>
-                (Confidence ${s.confidence})
+                
             </li>`;
         });
     }
@@ -665,7 +707,8 @@ function renderRecoSafe(data, container, title) {
             html += `
                 <li>
                     <strong>${p.product_name}</strong>
-                    <span class="text-muted">(Confidence ${p.confidence})</span>
+                   
+
                 </li>`;
         });
     }
@@ -680,7 +723,7 @@ function renderRecoSafe(data, container, title) {
             html += `
                 <li>
                     <strong>${s.service_name}</strong>
-                    <span class="text-muted">(Confidence ${s.confidence})</span>
+                    
                 </li>`;
         });
     }
@@ -725,10 +768,6 @@ document.getElementById("messageTemplate").addEventListener("change", function (
         document.getElementById("emailSubjectDiv").style.display = "none";
     }
 });
-
-/* --------------------------------------------------
-   SEND MESSAGE
--------------------------------------------------- */
 function openSendModal() {
     const cust = document.getElementById("customerDropdown");
     const temp = document.getElementById("messageTemplate");
@@ -739,44 +778,133 @@ function openSendModal() {
     const name = cust.selectedOptions[0].text;
     const tmpl = temp.selectedOptions[0].text;
     const msg = document.getElementById("messagePreview").value;
-    const phone = cust.selectedOptions[0].dataset.phone;
+    const phone = cust.selectedOptions[0].dataset.phone || "";
+    const channel = temp.selectedOptions[0].dataset.type;
 
     if (!msg.trim()) return alert("Message is empty.");
-    if (!phone) return alert("Customer has no phone.");
+
+    if (channel === "whatsapp" && !phone) {
+        return alert("Customer has no phone number.");
+    }
 
     document.getElementById("confirmCustomer").textContent = name;
     document.getElementById("confirmTemplate").textContent = tmpl;
     document.getElementById("confirmBody").textContent = msg;
 
-    document.getElementById("confirmBody").dataset.finalMessage = msg;
-    document.getElementById("confirmBody").dataset.phone = phone;
+    // store values safely
+    const bodyEl = document.getElementById("confirmBody");
+    bodyEl.dataset.finalMessage = msg;
+    bodyEl.dataset.channel = channel;
+    bodyEl.dataset.phone = phone;
 
-    new bootstrap.Modal(document.getElementById("sendConfirmModal")).show();
+    new bootstrap.Modal(
+        document.getElementById("sendConfirmModal")
+    ).show();
 }
 
+let statusPoller = null;
 async function confirmSend() {
+
+    const sendBtn =
+        document.querySelector("#sendConfirmModal .btn-success");
+    sendBtn.disabled = true;
+    sendBtn.textContent = "Sending...";
+
+    const templateOpt =
+        document.getElementById("messageTemplate").selectedOptions[0];
+    const customerOpt =
+        document.getElementById("customerDropdown").selectedOptions[0];
+
+    const bodyEl = document.getElementById("confirmBody");
+
+    const phone = customerOpt.dataset.phone;
+    const email = customerOpt.dataset.email;
+
     const payload = {
-        customer_id: document.getElementById("customerDropdown").value,
-        template_id: document.getElementById("messageTemplate").value,
-        phone: document.getElementById("confirmBody").dataset.phone,
-        rendered_message: document.getElementById("confirmBody").dataset.finalMessage
+        customer_id: customerOpt.value,
+        template_id: templateOpt.value || null,
+        send_channel: bodyEl.dataset.channel,
+        message_body: bodyEl.dataset.finalMessage
     };
+
+    // Frontend validation
+    if (payload.send_channel === "whatsapp" && !phone) {
+        alert("Customer has no phone number");
+        sendBtn.disabled = false;
+        sendBtn.textContent = "Send Now";
+        return;
+    }
+
+    if (payload.send_channel === "email" && !email) {
+        alert("Customer has no email address");
+        sendBtn.disabled = false;
+        sendBtn.textContent = "Send Now";
+        return;
+    }
 
     try {
         const res = await fetch("/api/send-message/", {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: {
+                "Content-Type": "application/json",
+                "X-CSRFToken": getCookie("csrftoken")
+            },
             body: JSON.stringify(payload)
         });
 
-        const data = await res.json();
+        let data;
+        try {
+            data = await res.json();
+        } catch {
+            throw { error: "Invalid server response" };
+        }
 
-        if (data.status === "success") alert("Message sent!");
-        else alert("Failed: " + data.error);
+        if (!res.ok || !data.sent) {
+            throw data;
+        }
+
+        alert("Message queued successfully 🚀");
+
+        bootstrap.Modal
+            .getInstance(document.getElementById("sendConfirmModal"))
+            .hide();
+
+        if (data.message_id) {
+            startStatusPolling(data.message_id);
+        }
 
     } catch (err) {
-        alert("Network error.");
+        console.error("Send failed", err);
+        alert(err?.error || "Failed to send message");
+    } finally {
+        sendBtn.disabled = false;
+        sendBtn.textContent = "Send Now";
     }
+}
+
+function startStatusPolling(messageId) {
+    let attempts = 0;
+
+    const poller = setInterval(async () => {
+        attempts++;
+
+        try {
+            const res = await fetch(`/api/message-status/${messageId}/`);
+            const data = await res.json();
+
+            console.log("Status update:", data);
+
+            if (data.delivery_status === "read" || attempts > 10) {
+                clearInterval(poller);
+                alert(`Message ${data.delivery_status} ✅`);
+            }
+
+        } catch (e) {
+            console.error("Polling failed", e);
+            clearInterval(poller);
+        }
+
+    }, 3000);
 }
 
 /* --------------------------------------------------

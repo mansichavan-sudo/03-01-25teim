@@ -101,7 +101,6 @@
                 <th>Recommended Service</th>
                 <th>Category</th>
                 <th>Business Intent</th>
-                <th>Algorithm</th>
                 <th>Action</th>
             </tr>
             <tr class="table-light">
@@ -137,13 +136,27 @@
                     <td>{{ rec.recommended_product|default:"—" }}</td>
                     <td>{{ rec.recommended_service|default:"—" }}</td>
                     <td>{{ rec.category|default:"—" }}</td>
-                    <td>{{ rec.business_intent }}</td>
-                    <td>{{ rec.algorithm_strategy }}</td>
+                   <td class="text-capitalize">{{ rec.business_intent }}</td>
 
-                    <td class="action-icons">
-                        <i class="bi bi-whatsapp text-success"></i>
-                        <i class="bi bi-envelope-fill text-primary"></i>
-                    </td>
+
+                   <td class="action-icons text-center">
+    {% if rec.phone %}
+        <a href="https://wa.me/{{ rec.phone }}" target="_blank" title="WhatsApp">
+            <i class="bi bi-whatsapp text-success"></i>
+        </a>
+    {% else %}
+        <i class="bi bi-whatsapp text-muted"></i>
+    {% endif %}
+
+    {% if rec.email %}
+        <a href="mailto:{{ rec.email }}" title="Email">
+            <i class="bi bi-envelope-fill text-primary"></i>
+        </a>
+    {% else %}
+        <i class="bi bi-envelope-fill text-muted"></i>
+    {% endif %}
+</td>
+
                 </tr>
             {% empty %}
                 <tr>
